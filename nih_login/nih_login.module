@@ -1,0 +1,287 @@
+<?php
+/**
+ * @file
+ * A block module that allows users to login with NIH NED credentials.
+ */
+ 
+/**
+ * Implements hook_form_user_login_block_alter
+ *
+ * Calls helper function _nih_login_user_login_form_alter because more than one hook will call this code
+ *
+ * @param form 
+ *   Array of form elements and attributes
+ * @param form_state
+ *   Array of attributes pertaining to the form element
+ */
+function nih_login_form_user_login_block_alter(&$form, &$form_state) {
+	_nih_login_user_login_form_alter($form, $form_state);
+}
+
+/**
+ * Implements hook_form_user_login_alter
+ *
+ * Calls helper function _nih_login_user_login_form_alter because more than one hook will call this code
+ *
+ * @param form 
+ *   Array of form elements and attributes
+ * @param form_state
+ *   Array of attributes pertaining to the form element
+ */
+function nih_login_form_user_login_alter(&$form, &$form_state) {
+	_nih_login_user_login_form_alter($form, $form_state);
+}
+
+
+/**
+ * Removes the "forgot password" link
+ * Changes the validator element values to nih_login_authenticate_validate
+ *
+ * @param form 
+ *   Array of form elements and attributes
+ * @param form_state
+ *   Array of attributes pertaining to the form element
+ */
+function _nih_login_user_login_form_alter(&$form, &$form_state) {
+	
+	array_unshift($form, array(
+    	'#type' => 'item',
+    	'#title' => t('Please log in using your NED credentials'),
+  	));
+	// overrides the default validator
+	foreach( $form as $key => $value ) {
+		if( $key == '#validate' ) {
+			foreach( $value as $validator_key => $validator ) {
+				if( $validator == 'user_login_authenticate_validate' ) {
+					$form[ $key ][ $validator_key ] = 'nih_login_authenticate_validate';
+				}
+			}
+		}elseif($key == "links"){
+			$form[ $key ] = "";
+		}elseif($key == "name"){
+			$form[ $key ]["#description"] = t("Enter your NED username");
+		}elseif($key == "pass"){
+			$form[ $key ]["#description"] = t("Enter your NED password");
+		}else {
+			$form[ $key ] = $value;
+		}
+	}
+	
+}
+
+function nih_login_menu_alter(&$items) {
+	$items['user/password']['access callback'] = FALSE;
+	$items['user/reset/%/%/%']['access callback'] = FALSE;
+}
+
+/**
+ * Implements hook_authenticate_validate
+ *
+ * Authenticate a username and password off of NIH NED
+ *
+ * @param form 
+ *   Array of form elements and attributes
+ * @param form_state
+ *   Array of attributes pertaining to the form element
+ */
+function nih_login_authenticate_validate( $form, &$form_state ) {
+	$name = $form_state[ 'values' ][ 'name' ];
+	$pass = $form_state[ 'values' ][ 'pass' ];
+	$xsd_url = variable_get('nih_login_xsd_url', 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd');
+	$endpoint_url = variable_get('nih_login_nedperson_endpoint', 'https://soa.nih.gov/NEDPerson/NEDPersonOPSv2/WSDLNEDPersonOP-service.serviceagent/PortTypeEndpoint0');
+	$wsdl_url = variable_get('nih_login_wsdl_url', 'https://soa.nih.gov/NEDPerson/NEDPersonOPSv2/WSDLNEDPersonOP-service.serviceagent?wsdl');
+	$web_service_data = array();
+	$wsse_header = new WsseAuthHeader($name, $pass, $xsd_url);
+	
+	$options = array(
+		'trace'          => true,
+		'exceptions'     => true,
+		'cache_wsdl'     => WSDL_CACHE_NONE,
+		'keep_alive'     => true,
+		'connection_timeout'=> 1800,
+		'features'       => SOAP_SINGLE_ELEMENT_ARRAYS,
+		'location'       => $endpoint_url
+	);
+
+	$client = new SoapClient($wsdl_url, $options); 
+	$client->__setSoapHeaders(array($wsse_header));
+
+	try{
+		$web_service_data = $client->ByADaccount(array('Identifier'=>$name));
+	}catch(Exception $e){
+		return false;
+	}
+	
+	if(!empty($web_service_data)){
+		$web_service_data = json_decode(json_encode($web_service_data),true);
+		
+		$email = false;
+		foreach($web_service_data["NEDPerson"]["EmailAddresses"]["EmailAddress"] as $single_email_address){
+			if(!empty($single_email_address["EmailAddressType"]) && $single_email_address["EmailAddressType"] == "Preferred"){
+				$email = $single_email_address["_"];
+				break;
+			}
+		}
+		
+		$first_name = false;
+		$last_name = false;
+		foreach($web_service_data["NEDPerson"]["Names"]["Name"] as $single_name){
+			if($single_name["NameType"] == "Legal"){
+				$first_name = $single_name["GivenName"];
+				$last_name = $single_name["MixCaseSurname"];
+				break;
+			}
+		}
+
+		global $_nih_login_email; 
+		$_nih_login_email = $email;
+		global $_nih_login_first_name;
+		$_nih_login_first_name = $first_name;
+		global $_nih_login_last_name;
+		$_nih_login_last_name = $last_name;
+		
+		// this sets up the external user with Drupal by creating a local entry. If they don't exist they are added
+		user_external_login_register($name, "nih_login");
+		
+		// we must set the 'uid' to pass back.  this looks up the logged in user and sets the Drupal UID
+		$account = user_external_load($name);
+	    $form_state['uid'] = $account->uid;
+	}else{
+		return false;
+	}
+}
+
+/**
+ * Implements hook_user_presave
+ *
+ * Updates a user fields
+ *
+ * @param edit 
+ *   The array of form values submitted by the user.
+ * @param account
+ *   The user object on which the operation is being performed.
+ * @category
+ *   The active category of user information being edited.
+ */
+function nih_login_user_presave(&$edit, &$account, $category = null){
+	
+	if(!empty($account->is_new)){
+	  	global $_nih_login_email; 
+		global $_nih_login_first_name;
+		global $_nih_login_last_name;
+		$default_role_id = variable_get('nih_login_default_role', 2);
+		$user_role_obj = user_role_load($default_role_id);
+
+		$edit['pass'] = '';
+		$edit['init'] = $_nih_login_email;
+		$edit['mail'] = $_nih_login_email;
+		$edit['field_first_name']['und'][0]['value'] = $_nih_login_first_name;
+		$edit['field_last_name']['und'][0]['value'] = $_nih_login_last_name;
+		$edit['roles'] = array($default_role_id => $user_role_obj->name);
+	}else{
+		//don't allow them to update these fields
+		$edit["name"] = $account->original->name;
+		$edit["mail"] = $account->original->mail;
+		$edit['field_first_name']['und'][0]['value'] = $account->original->field_first_name['und'][0]['value'];
+		$edit['field_last_name']['und'][0]['value'] = $account->original->field_last_name['und'][0]['value'];;
+	}
+	
+}
+
+/**
+ * Implements hook_help.
+ *
+ * Displays help and module information.
+ *
+ * @param path 
+ *   Which path of the site we're using to display help
+ * @param arg 
+ *   Array that holds the current path as returned from arg() function
+ */
+function nih_login_help($path, $arg) { 
+  switch ($path) {
+    case "admin/help#nih_login":
+      return '<p>' . t("Allows users to login using NIH NED credentials.") . '</p>';
+      break;
+  }
+} 
+
+/**
+ * Implements hook_menu().
+ */
+function nih_login_menu() {
+  $items = array();
+
+  $items['admin/config/content/nih_login'] = array(
+    'title' => 'NIH Login',
+    'description' => 'Configuration for NIH Login',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('nih_login_form'),
+    'access arguments' => array('access administration pages'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Page callback: NIH Login settings
+ *
+ * @see nih_login_menu()
+ */
+function nih_login_form($form, &$form_state) {
+  $form['nih_login_default_role'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default Role'),
+    '#default_value' => variable_get('nih_login_default_role', 2),
+    '#size' => 2,
+    '#maxlength' => 2,
+    '#description' => t('The default role ID given to a user logging in for the first time.'),
+    '#required' => TRUE,
+  );
+  $form['nih_login_xsd_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('.xsd Document URL'),
+    '#default_value' => variable_get('nih_login_xsd_url', 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd'),
+    '#size' => 130,
+    '#description' => t('The URL to the .xsd document.'),
+    '#required' => TRUE,
+  );
+  $form['nih_login_nedperson_endpoint'] = array(
+    '#type' => 'textfield',
+    '#title' => t('NEDPerson Endpoint'),
+    '#default_value' => variable_get('nih_login_nedperson_endpoint', 'https://soa.nih.gov/NEDPerson/NEDPersonOPSv2/WSDLNEDPersonOP-service.serviceagent/PortTypeEndpoint0'),
+    '#size' => 130,
+    '#description' => t('The URL to the NEDPerson web service endpoint.'),
+    '#required' => TRUE,
+  );
+  $form['nih_login_wsdl_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('WSDL URL'),
+    '#default_value' => variable_get('nih_login_wsdl_url', 'https://soa.nih.gov/NEDPerson/NEDPersonOPSv2/WSDLNEDPersonOP-service.serviceagent?wsdl'),
+    '#size' => 130,
+    '#description' => t('The URL to the NEDPerson web service WSDL.'),
+    '#required' => TRUE,
+  );
+
+  return system_settings_form($form); 
+}
+
+/**
+ * Implements validation from the Form API.
+ * 
+ * @param $form
+ *   A structured array containing the elements and properties of the form.
+ * @param $form_state
+ *   An array that stores information about the form's current state 
+ *   during processing.
+ */
+function nih_login_form_validate($form, &$form_state){
+  $default_role_id = $form_state['values']['nih_login_default_role'];
+  if (!is_numeric($default_role_id)){
+    form_set_error('nih_login_default_role', t('Role ID must be a number.'));
+  }
+  else if ($default_role_id <= 0){
+    form_set_error('nih_login_default_role', t('Role ID must be positive.'));
+  }
+}

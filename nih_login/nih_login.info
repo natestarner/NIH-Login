@@ -1,0 +1,9 @@
+name = NIH Login
+description = Authenticates with NIH NED
+package = Authentication
+core = 7.x
+files[] = wsseAuthHeader.php
+
+version = "7.x-1.0"
+project = "NIH Login"
+configure = admin/config/content/nih_login
